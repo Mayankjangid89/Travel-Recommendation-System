@@ -27,7 +27,7 @@ User Query → Intent Parser → Trip Planner → Package Search (DB/Scraping)
 - **Cache**: Redis
 - **Queue**: Celery + Redis
 - **Scraping**: BeautifulSoup, Selenium, Playwright
-- **LLM**: OpenAI GPT-4 for response generation
+- **LLM**: Gemini 2.5 flask lite
 
 ## 🚀 Quick Start
 
@@ -155,23 +155,10 @@ pytest tests/test_parser.py -v
 docker-compose up -d
 ```
 
-## 📝 Development Status
-
-- [x] Day 1: Database schema & models
-- [ ] Day 2: Intent parser & trip planner
-- [ ] Day 3: Agency discovery engine
-- [ ] Day 4: Scraper engine
-- [ ] Day 5: Normalizer & filter
-- [ ] Day 6: Ranking engine
-- [ ] Day 7: FastAPI endpoints
-- [ ] Day 8: Background workers
-- [ ] Day 9: Production setup
-- [ ] Day 10: MVP UI
-
 ## 📄 License
 
 MIT
 
 ## 👥 Contributing
 
-This is a production startup project. Contributions welcome via pull requests.
+This is my own project
