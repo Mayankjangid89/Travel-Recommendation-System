@@ -154,6 +154,10 @@ class ScraperEngine:
                     await page.wait_for_timeout(2000)
 
                     html_content = await page.content()
+                    with open("output_last_scrape.html", "w", encoding="utf-8") as f:
+                        f.write(html_content)
+                    print("✅ HTML saved to output_last_scrape.html")
+
                     await page.close()
 
                 result["html_length"] = len(html_content)
@@ -220,7 +224,8 @@ class ScraperEngine:
 
         try:
             page = await self.browser.new_page()
-            await page.goto(base_url, wait_until="domcontentloaded", timeout=self.timeout)
+            await page.goto(url, wait_until="networkidle")
+            await page.wait_for_timeout(3000)
 
             links = await page.evaluate(
                 "() => Array.from(document.querySelectorAll('a[href]')).map(a => a.href)"

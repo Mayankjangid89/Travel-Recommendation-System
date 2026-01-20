@@ -1,297 +1,329 @@
 """
-Intent Parser - Extracts structured data from natural language queries
-Uses regex patterns + NLP + optional LLM fallback
+Intent Parser - Extract structured intent from user travel queries
+
+Examples:
+- "I want to go Manali-Kasol for 5 days, budget 20000 per person, with friends"
+- "Goa beach trip 4 days under 15000 couple"
+- "Dubai Abu Dhabi 6 days max 80000 with friends"
 """
 
+from __future__ import annotations
+
 import re
-import logging
 from typing import List, Optional
 
 from agents.models import ParsedIntent, TripType, GroupType
 
-logger = logging.getLogger(__name__)
-
 
 class IntentParser:
-    """
-    Parse natural language travel queries into structured intent
-    """
-
-    # Indian cities (expand this list as needed)
-    INDIAN_CITIES = {
-        "manali", "kasol", "amritsar", "delhi", "mumbai", "goa", "jaipur",
-        "udaipur", "shimla", "ladakh", "kerala", "agra", "varanasi", "rishikesh",
-        "darjeeling", "gangtok", "ooty", "coorg", "bangalore", "chennai",
-        "hyderabad", "kolkata", "pune", "ahmedabad", "srinagar", "leh",
-        "mcleodganj", "dharamshala", "nainital", "mussoorie", "haridwar"
-    }
-
-    # International destinations
-    COUNTRIES = {
-        "uae": ["dubai", "abu dhabi", "sharjah"],
-        "thailand": ["bangkok", "phuket", "pattaya", "krabi"],
-        "singapore": ["singapore"],
-        "malaysia": ["kuala lumpur", "langkawi", "penang"],
-        "maldives": ["male", "maldives"],
-        "sri lanka": ["colombo", "kandy", "galle"],
-        "nepal": ["kathmandu", "pokhara"],
-        "bhutan": ["thimphu", "paro"],
-        "bali": ["bali", "ubud"],
-        "vietnam": ["hanoi", "ho chi minh"],
-        "usa": ["new york", "los angeles", "las vegas", "san francisco"],
-        "uk": ["london", "manchester", "edinburgh"],
-        "france": ["paris"],
-        "italy": ["rome", "venice", "milan"],
-        "switzerland": ["zurich", "geneva", "interlaken"],
-    }
-
-    GROUP_KEYWORDS = {
-        GroupType.SOLO: ["solo", "alone", "single", "myself"],
-        GroupType.COUPLE: ["couple", "honeymoon", "romantic", "spouse", "partner"],
-        GroupType.FAMILY: ["family", "kids", "children", "parents"],
-        GroupType.FRIENDS: ["friends", "buddies", "group of friends"],
-        GroupType.GROUP: ["group", "team", "people"],
-    }
-
     def __init__(self):
-        self.city_pattern = self._build_city_pattern()
+        # A small list of popular Indian cities + destinations
+        # Later: replace with DB + Geo lookup (Nominatim/Google Places)
+        self.known_places = [
+            "manali", "kasol", "kullu", "amritsar", "shimla", "jaipur", "udaipur",
+            "jodhpur", "goa", "kerala", "kochi", "munnar", "delhi", "agra",
+            "varanasi", "rishikesh", "haridwar", "leh", "ladakh", "srinagar",
+            "dharamshala", "dalhousie", "chandigarh", "mysore", "ooty",
+            "kashmir", "pune", "mumbai", "bangalore", "hyderabad", "ahmedabad",
+            "gandhinagar", "gurugram", "udaipur", "pushkar"
+        ]
 
-    def _build_city_pattern(self) -> re.Pattern:
-        """Build regex pattern for city detection"""
-        all_cities = list(self.INDIAN_CITIES)
-        for cities in self.COUNTRIES.values():
-            all_cities.extend(cities)
+        # Simple country keyword list for trip-type detection
+        self.country_keywords = [
+            "india", "uae", "dubai", "abu dhabi", "singapore", "malaysia",
+            "thailand", "bali", "indonesia", "nepal", "bhutan", "sri lanka",
+            "vietnam", "usa", "uk", "canada", "australia"
+        ]
 
-        # Longest first so "Abu Dhabi" is matched before "Abu"
-        all_cities.sort(key=len, reverse=True)
+        # Group type keywords
+        self.group_map = {
+            GroupType.SOLO: ["solo", "alone", "single"],
+            GroupType.COUPLE: ["couple", "honeymoon", "partner", "wife", "husband"],
+            GroupType.FAMILY: ["family", "parents", "kids", "children"],
+            GroupType.FRIENDS: ["friends", "bros", "gang", "group of friends"],
+            GroupType.GROUP: ["group", "team", "corporate"]
+        }
 
-        pattern = "|".join(re.escape(city) for city in all_cities)
-        return re.compile(pattern, re.IGNORECASE)
-
+    # -------------------------------------------------------------------------
+    # MAIN PARSE
+    # -------------------------------------------------------------------------
     def parse(self, query: str) -> ParsedIntent:
-        """
-        Main parsing method
-        """
-        query_lower = query.lower()
+        q = query.strip()
+
+        destinations = self._extract_destinations(q)
+        countries = self._extract_countries(q)
+        duration_days = self._extract_duration_days(q)
+        budget = self._extract_budget(q)
+        group_type = self._extract_group_type(q)
+        group_size = self._extract_group_size(q)
+
+        trip_type = self._determine_trip_type(destinations, countries)
+
+        preferences = self._extract_preferences(q)
+        must_include = self._extract_must_include(q)
 
         return ParsedIntent(
-            raw_query=query,
-            destinations=self._extract_destinations(query_lower),
-            countries=self._extract_countries(query_lower),
-            duration_days=self._extract_duration(query_lower),
-            budget_per_person=self._extract_budget(query_lower),
-            currency=self._extract_currency(query_lower),
-            group_type=self._extract_group_type(query_lower),
-            group_size=self._extract_group_size(query_lower),
-            trip_type=self._determine_trip_type(query_lower),
-            preferences=self._extract_preferences(query_lower),
-            must_include=self._extract_must_include(query_lower),
+            raw_query=q,
+            destinations=destinations,
+            countries=countries,
+            duration_days=duration_days,
+            budget_per_person=budget,
+            currency="INR",
+            group_type=group_type,
+            group_size=group_size,
+            trip_type=trip_type,
+            preferences=preferences,
+            must_include=must_include,
+            flexibility_days=2
         )
 
+    # -------------------------------------------------------------------------
+    # DESTINATIONS
+    # -------------------------------------------------------------------------
     def _extract_destinations(self, query: str) -> List[str]:
-        """Extract city/destination names"""
-        matches = self.city_pattern.findall(query)
-        destinations = [match.title() for match in matches]
+        q = query.lower()
 
+        # Extract from "Manali-Kasol" type patterns
+        hyphen_matches = re.findall(r"([a-zA-Z]+(?:\s[a-zA-Z]+)*)\s*-\s*([a-zA-Z]+(?:\s[a-zA-Z]+)*)", query)
+        found = []
+        for a, b in hyphen_matches:
+            found.append(a.strip())
+            found.append(b.strip())
+
+        # Add known places
+        for place in self.known_places:
+            if re.search(rf"\b{re.escape(place)}\b", q):
+                found.append(place)
+
+        # Cleanup: remove duplicates + normalize title case
+        cleaned = []
         seen = set()
-        unique_destinations = []
-        for dest in destinations:
-            if dest.lower() not in seen:
-                seen.add(dest.lower())
-                unique_destinations.append(dest)
+        for d in found:
+            dd = d.strip().lower()
+            if dd and dd not in seen:
+                seen.add(dd)
+                cleaned.append(dd.title())
 
-        return unique_destinations
+        return cleaned
+
+    # -------------------------------------------------------------------------
+    # COUNTRIES
+    # -------------------------------------------------------------------------
     def _extract_countries(self, query: str) -> List[str]:
-        """Extract countries from query"""
+        q = query.lower()
+        found = []
+
+        for word in self.country_keywords:
+            if re.search(rf"\b{re.escape(word)}\b", q):
+                found.append(word)
+
+        # Normalize
         countries = []
-        query_lower = query.lower()
+        seen = set()
+        for c in found:
+            cc = c.strip().lower()
+            if cc not in seen:
+                seen.add(cc)
+                countries.append(cc.title())
 
-        # ✅ If India word is present, add India immediately
-        if "india" in query_lower:
-            countries.append("India")
+        # If only Indian cities were detected, keep India
+        if countries and "India" not in countries:
+            # allow international without forcing India
+            return countries
 
-        # International country or city detection
-        for country, cities in self.COUNTRIES.items():
-            if country in query_lower:
-                countries.append(country.title())
-            elif any(city in query_lower for city in cities):
-                countries.append(country.title())
+        if "India" in countries:
+            return ["India"]
 
-        # Also infer India from Indian destinations
-        destinations_lower = [d.lower() for d in self._extract_destinations(query_lower)]
-        if any(city in destinations_lower for city in self.INDIAN_CITIES):
-            if "India" not in countries:
-                countries.append("India")
+        # If no explicit country but query has Indian cities → India
+        if any(d.lower() in self.known_places for d in self._extract_destinations(query)):
+            return ["India"]
 
-        # Remove duplicates
-        return list(set(countries))
+        return countries
 
-    def _determine_trip_type(self, query: str) -> TripType:
-        """
-        Determine if domestic, international, or multi-country.
+    # -------------------------------------------------------------------------
+    # DURATION
+    # -------------------------------------------------------------------------
+    def _extract_duration_days(self, query: str) -> Optional[int]:
+        q = query.lower()
 
-        Rules (to pass your tests):
-        - Only India or no country -> DOMESTIC
-        - India + any other country -> MULTI_COUNTRY
-        - Multiple foreign countries -> MULTI_COUNTRY
-        - One foreign country only -> INTERNATIONAL
-        """
-        countries = self._extract_countries(query)
+        # "5 days"
+        m = re.search(r"(\d+)\s*days?", q)
+        if m:
+            return int(m.group(1))
 
-        if not countries:
-            return TripType.DOMESTIC
+        # "7d"
+        m = re.search(r"(\d+)\s*d\b", q)
+        if m:
+            return int(m.group(1))
 
-        countries_lower = {c.lower() for c in countries}
-
-        if countries_lower == {"india"}:
-            return TripType.DOMESTIC
-
-        if "india" in countries_lower and len(countries_lower) >= 2:
-            return TripType.MULTI_COUNTRY
-
-        if len(countries_lower) >= 2:
-            return TripType.MULTI_COUNTRY
-
-        return TripType.INTERNATIONAL
-
-    def _extract_duration(self, query: str) -> Optional[int]:
-        """Extract trip duration in days"""
-        patterns = [
-            r"(\d+)\s*(?:days?|nights?)",
-            r"(\d+)[-\s]day",
-            r"for\s*(\d+)\s*(?:days?|nights?)",
-        ]
-
-        for pattern in patterns:
-            match = re.search(pattern, query)
-            if match:
-                return int(match.group(1))
+        # "3 nights" -> approximate to nights+1 days
+        m = re.search(r"(\d+)\s*nights?", q)
+        if m:
+            return int(m.group(1)) + 1
 
         return None
 
+    # -------------------------------------------------------------------------
+    # BUDGET (✅ FIXED: under/below/max/within/upto + 15k support)
+    # -------------------------------------------------------------------------
     def _extract_budget(self, query: str) -> Optional[float]:
-        """Extract budget amount"""
+        """
+        Extract budget from query.
+
+        Supports:
+        - budget 20000
+        - ₹20000
+        - 20k / 20 k
+        - under 15000
+        - below 15000
+        - within 15000
+        - max 15000
+        - upto 15000 / up to 15000
+        """
+        q = query.lower().strip()
+
         patterns = [
-            r"budget\s*(?:of)?\s*(?:inr|rs|₹)?\s*(\d+(?:,\d+)*(?:\.\d+)?)\s*(?:k|thousand|lakh)?",
-            r"(?:inr|rs|₹)\s*(\d+(?:,\d+)*(?:\.\d+)?)\s*(?:k|thousand|lakh)?",
-            r"(\d+(?:,\d+)*(?:\.\d+)?)\s*(?:k|thousand|lakh)?\s*(?:inr|rupees|rs)",
-            r"(\d+(?:,\d+)*)\s*per\s*person",
+            r"(?:budget|price|cost)\s*(?:is|=|:)?\s*₹?\s*([\d,]+)",
+            r"(?:under|below|max|within|upto|up to)\s*₹?\s*([\d,]+)",
+            r"₹\s*([\d,]+)",
+            r"(\d+(?:\.\d+)?)\s*k\b",  # 15k
         ]
 
-        for pattern in patterns:
-            match = re.search(pattern, query, re.IGNORECASE)
-            if match:
-                amount_str = match.group(1).replace(",", "")
-                amount = float(amount_str)
+        for p in patterns:
+            m = re.search(p, q)
+            if not m:
+                continue
 
-                span_text = query[match.start():match.end()].lower()
-                if "k" in span_text:
-                    amount *= 1000
-                elif "thousand" in span_text:
-                    amount *= 1000
-                elif "lakh" in span_text:
-                    amount *= 100000
+            value = m.group(1).replace(",", "").strip()
 
-                return amount
+            # if 15k
+            if "k" in p:
+                try:
+                    return float(value) * 1000
+                except:
+                    continue
+
+            try:
+                return float(value)
+            except:
+                continue
 
         return None
 
-    def _extract_currency(self, query: str) -> str:
-        """Extract currency (default INR)"""
-        if any(keyword in query for keyword in ["usd", "dollar", "$"]):
-            return "USD"
-        if any(keyword in query for keyword in ["eur", "euro", "€"]):
-            return "EUR"
-        if any(keyword in query for keyword in ["aed", "dirham"]):
-            return "AED"
-        return "INR"
-
+    # -------------------------------------------------------------------------
+    # GROUP TYPE
+    # -------------------------------------------------------------------------
     def _extract_group_type(self, query: str) -> Optional[GroupType]:
-        """Extract who is traveling"""
-        for group_type, keywords in self.GROUP_KEYWORDS.items():
-            if any(keyword in query for keyword in keywords):
-                return group_type
+        q = query.lower()
+
+        for group_type, keywords in self.group_map.items():
+            for kw in keywords:
+                if kw in q:
+                    return group_type
+
         return None
 
+    # -------------------------------------------------------------------------
+    # GROUP SIZE
+    # -------------------------------------------------------------------------
     def _extract_group_size(self, query: str) -> Optional[int]:
-        """Extract number of people"""
-        patterns = [
-            r"(\d+)\s*(?:people|persons|pax)",
-            r"group\s*of\s*(\d+)",
-            r"(\d+)\s*(?:adults?|travelers?)",
-        ]
-
-        for pattern in patterns:
-            match = re.search(pattern, query, re.IGNORECASE)
-            if match:
-                return int(match.group(1))
+        q = query.lower()
+        # "4 people", "5 persons", "group of 6"
+        m = re.search(r"(group of\s*)?(\d+)\s*(people|persons|members|friends)?", q)
+        if m:
+            val = int(m.group(2))
+            # ignore tiny random numbers like "5 days" incorrectly matched
+            if "days" in q and str(val) in q:
+                # protect from duration collision
+                # only accept group size if keyword exists
+                if any(k in q for k in ["people", "persons", "members", "friends", "group of"]):
+                    return val
+                return None
+            return val
 
         return None
 
+    # -------------------------------------------------------------------------
+    # TRIP TYPE
+    # -------------------------------------------------------------------------
+    def _determine_trip_type(self, destinations: List[str], countries: List[str]) -> TripType:
+        """
+        Determine domestic/international/multi-country.
+        """
+        # If user has multiple countries, treat as multi-country
+        if len(countries) >= 2:
+            return TripType.MULTI_COUNTRY
+
+        # If explicit India or Indian cities
+        if countries == ["India"]:
+            return TripType.DOMESTIC
+
+        # If countries exists but not India => international
+        if len(countries) == 1 and countries[0].lower() != "india":
+            return TripType.INTERNATIONAL
+
+        # Default
+        return TripType.DOMESTIC
+
+    # -------------------------------------------------------------------------
+    # PREFERENCES / MUST INCLUDE (basic placeholders)
+    # -------------------------------------------------------------------------
     def _extract_preferences(self, query: str) -> List[str]:
-        """Extract travel preferences"""
-        preferences = []
+        q = query.lower()
+        prefs = []
 
-        preference_keywords = {
-            "adventure": ["adventure", "trekking", "hiking", "rafting", "camping"],
-            "luxury": ["luxury", "5-star", "premium", "deluxe"],
-            "budget": ["budget", "cheap", "affordable", "economical"],
-            "beach": ["beach", "coastal", "seaside", "island"],
-            "mountains": ["mountain", "hill", "himalaya", "peak"],
-            "cultural": ["cultural", "heritage", "historical", "temple"],
-            "party": ["party", "nightlife", "club", "pub"],
-            "relaxation": ["relax", "peaceful", "calm", "quiet", "spa"],
-            "family-friendly": ["family", "kids", "children"],
-            "romantic": ["romantic", "honeymoon", "couple"],
-        }
+        possible = [
+            "beach", "mountains", "adventure", "trek", "luxury", "budget",
+            "honeymoon", "camping", "snow", "sightseeing", "shopping"
+        ]
+        for p in possible:
+            if p in q:
+                prefs.append(p)
 
-        for pref, keywords in preference_keywords.items():
-            if any(keyword in query for keyword in keywords):
-                preferences.append(pref)
-
-        return preferences
+        return prefs
 
     def _extract_must_include(self, query: str) -> List[str]:
-        """Extract must-have inclusions"""
-        must_include = []
+        q = query.lower()
+        must = []
 
-        inclusion_keywords = {
-            "flights": ["flight", "airfare", "air ticket"],
-            "hotels": ["hotel", "accommodation", "stay"],
-            "meals": ["meals", "food", "breakfast", "dinner"],
-            "transport": ["transport", "cab", "car", "vehicle"],
-            "visa": ["visa"],
-            "sightseeing": ["sightseeing", "tour", "excursion"],
-            "guide": ["guide", "escort"],
-        }
+        # Detect simple "must include" terms
+        if "breakfast" in q:
+            must.append("breakfast")
+        if "hotel" in q:
+            must.append("hotel")
+        if "cab" in q or "taxi" in q:
+            must.append("cab")
+        if "flight" in q:
+            must.append("flight")
+        if "train" in q:
+            must.append("train")
 
-        for inclusion, keywords in inclusion_keywords.items():
-            if any(keyword in query for keyword in keywords):
-                must_include.append(inclusion)
-
-        return must_include
+        return must
 
 
+# -----------------------------------------------------------------------------
+# Standalone Testing
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     parser = IntentParser()
 
     test_queries = [
-        "I want to go Manali-Kasol-Amritsar for 7 days, budget 15000 per person, with friends",
-        "India → Abu Dhabi → Dubai → India, 8 days, budget 80000 INR, with friends",
-        "Goa beach vacation for 5 days, couple trip, budget 25k",
-        "Family trip to Kerala for 6 days with hotel and meals included",
+        "i want to go manali under 15000",
+        "Manali Kasol 5 days budget 20000 with friends",
+        "Goa 4 days below 12k couple",
+        "Dubai Abu Dhabi 6 days max 80000 with friends",
+        "Rajasthan tour 7 days budget 30000 with family"
     ]
 
-    print("🧠 Intent Parser Testing\n")
-    for i, query in enumerate(test_queries, 1):
-        print(f"Query {i}: {query}")
-        intent = parser.parse(query)
+    print("\n🧠 Intent Parser Testing\n" + "=" * 70)
+    for i, q in enumerate(test_queries, 1):
+        intent = parser.parse(q)
+        print(f"\nQuery {i}: {q}")
         print(f"  Destinations: {intent.destinations}")
         print(f"  Countries: {intent.countries}")
-        print(f"  Duration: {intent.duration_days} days")
-        print(f"  Budget: ₹{intent.budget_per_person}")
+        print(f"  Duration: {intent.duration_days}")
+        print(f"  Budget: {intent.budget_per_person}")
         print(f"  Group: {intent.group_type}")
         print(f"  Trip Type: {intent.trip_type}")
         print(f"  Preferences: {intent.preferences}")
         print(f"  Must Include: {intent.must_include}")
-        print()

@@ -42,3 +42,5 @@ ms-playwright/
 .pytest_cache/
 .coverage
 htmlcov/
+output_last_scrape.html
+logs/
