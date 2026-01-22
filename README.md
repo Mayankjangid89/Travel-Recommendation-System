@@ -1,4 +1,4 @@
-# 🧳 Travel AI Agent - Meta Travel Package Recommender
+#  Meta Travel Package Recommender
 
 > **Production-grade AI system** that aggregates travel packages from multiple agencies, normalizes data, and recommends the best options using intelligent ranking.
 
