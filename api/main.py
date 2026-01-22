@@ -5,7 +5,7 @@ from api.routes.packages import router as packages_router
 from api.routes.recommend import router as recommend_router
 
 app = FastAPI(
-    title="Travel AI Agent API",
+    title="Travel recommendation System",
     version="1.0.0",
     description="AI-powered travel package recommendation backend"
 )

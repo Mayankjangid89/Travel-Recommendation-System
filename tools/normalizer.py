@@ -1,201 +1,109 @@
 """
-Data Normalizer - Cleans and validates scraped data
-Converts messy scraped data into clean database-ready format
+Data Normalizer (Production Friendly)
+
+✅ Takes raw packages from scraper (Gemini / BS4)
+✅ Cleans fields
+✅ Ensures minimum valid schema
+✅ Drops only truly useless entries
+✅ Avoids rejecting everything
 """
-from typing import Dict, Any, List, Optional
-from datetime import datetime
+
 import re
 import logging
+from typing import List, Dict, Any, Optional
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
 
 class DataNormalizer:
-    """
-    Normalizes scraped travel package data
-    Handles data cleaning, validation, and standardization
-    """
-    
-    def normalize_package(self, raw_package: Dict[str, Any], agency_id: int) -> Optional[Dict[str, Any]]:
-        """
-        Normalize a single package
-        
-        Args:
-            raw_package: Raw scraped data
-            agency_id: Database agency ID
-        
-        Returns:
-            Normalized package dict or None if invalid
-        """
-        try:
-            normalized = {
-                "agency_id": agency_id,
-                "package_title": self._clean_title(raw_package.get("title", "")),
-                "url": raw_package.get("url", ""),
-                "price_in_inr": self._parse_price(raw_package.get("price_inr", 0)),
-                "duration_days": self._parse_duration(raw_package.get("duration_days", 0)),
-                "destinations": self._normalize_destinations(raw_package.get("destinations", [])),
-                "inclusions": self._normalize_list(raw_package.get("inclusions", [])),
-                "exclusions": self._normalize_list(raw_package.get("exclusions", [])),
-                "highlights": self._normalize_list(raw_package.get("highlights", [])),
-                "scraped_at": datetime.utcnow(),
-                "is_active": True
-            }
-            
-            # Validate required fields
-            if not self._validate_package(normalized):
-                logger.warning(f"❌ Invalid package data: {raw_package.get('title', 'Unknown')}")
-                return None
-            
-            return normalized
-            
-        except Exception as e:
-            logger.error(f"❌ Error normalizing package: {e}")
-            return None
-    
-    def normalize_packages_batch(
-        self, 
-        raw_packages: List[Dict[str, Any]], 
-        agency_id: int
-    ) -> List[Dict[str, Any]]:
-        """
-        Normalize multiple packages
-        
-        Args:
-            raw_packages: List of raw package dicts
-            agency_id: Database agency ID
-        
-        Returns:
-            List of normalized packages (invalid ones filtered out)
-        """
+    def __init__(self):
+        pass
+
+    def normalize_packages_batch(self, raw_packages: List[Dict[str, Any]], agency_id: int) -> List[Dict[str, Any]]:
         normalized = []
-        
-        for raw_pkg in raw_packages:
-            norm_pkg = self.normalize_package(raw_pkg, agency_id)
-            if norm_pkg:
-                normalized.append(norm_pkg)
-        
+        if not raw_packages:
+            logger.info("⚠️ No raw packages received for normalization")
+            return normalized
+
+        for pkg in raw_packages:
+            clean = self.normalize_one(pkg, agency_id)
+            if clean:
+                normalized.append(clean)
+            else:
+                # ✅ this is what you see as "Invalid package data: Unknown"
+                name = pkg.get("package_title") if isinstance(pkg, dict) else "Unknown"
+                print(f"❌ Invalid package data: {name}")
+
         logger.info(f"✅ Normalized {len(normalized)}/{len(raw_packages)} packages")
         return normalized
-    
-    def _clean_title(self, title: str) -> str:
-        """Clean package title"""
-        if not title:
-            return "Untitled Package"
-        
-        # Remove extra whitespace
-        title = " ".join(title.split())
-        
-        # Capitalize properly
-        title = title.title()
-        
-        # Limit length
-        if len(title) > 200:
-            title = title[:197] + "..."
-        
-        return title
-    
-    def _parse_price(self, price: Any) -> float:
-        """Parse price to float"""
-        if isinstance(price, (int, float)):
-            return float(price)
-        
-        if isinstance(price, str):
-            # Remove currency symbols and commas
-            price = re.sub(r'[₹$€,\s]', '', price)
-            try:
-                return float(price)
-            except ValueError:
-                return 0.0
-        
-        return 0.0
-    
-    def _parse_duration(self, duration: Any) -> int:
-        """Parse duration to integer days"""
-        if isinstance(duration, int):
-            return duration
-        
-        if isinstance(duration, str):
-            # Extract number from strings like "5 Days", "5D/4N"
-            match = re.search(r'(\d+)', duration)
-            if match:
-                return int(match.group(1))
-        
-        return 0
-    
-    def _normalize_destinations(self, destinations: Any) -> List[str]:
-        """Normalize destination list"""
-        if not destinations:
-            return []
-        
-        if isinstance(destinations, str):
-            # Split by common separators
-            destinations = re.split(r'[,\-→>]', destinations)
-        
+
+    def normalize_one(self, pkg: Dict[str, Any], agency_id: int) -> Optional[Dict[str, Any]]:
+        if not isinstance(pkg, dict):
+            return None
+
+        title = str(pkg.get("package_title") or "").strip()
+        url = str(pkg.get("url") or "").strip()
+
+        # ✅ if title missing, reject (without title, it's useless)
+        if not title or len(title) < 5:
+            return None
+
+        # ✅ Clean numeric fields
+        price = pkg.get("price_in_inr", 0)
+        price = self._safe_float(price)
+
+        days = pkg.get("duration_days", 0)
+        days = self._safe_int(days)
+
+        destinations = pkg.get("destinations", [])
         if not isinstance(destinations, list):
-            return []
-        
-        # Clean each destination
-        cleaned = []
-        for dest in destinations:
-            if isinstance(dest, str):
-                dest = dest.strip().title()
-                if dest and dest not in cleaned:
-                    cleaned.append(dest)
-        
-        return cleaned
-    
-    def _normalize_list(self, items: Any) -> List[str]:
-        """Normalize a list of strings"""
-        if not items:
-            return []
-        
-        if isinstance(items, str):
-            items = [items]
-        
-        if not isinstance(items, list):
-            return []
-        
-        cleaned = []
-        for item in items:
-            if isinstance(item, str):
-                item = item.strip()
-                if item and item not in cleaned:
-                    cleaned.append(item)
-        
-        return cleaned
-    
-    def _validate_package(self, package: Dict[str, Any]) -> bool:
-        """
-        Validate package has minimum required fields
-        
-        Returns:
-            True if valid
-        """
-        # Must have title
-        if not package.get("package_title"):
+            destinations = []
+
+        destinations = [str(d).strip() for d in destinations if str(d).strip()]
+
+        # ✅ if url missing, keep it empty (DON'T reject)
+        # many sites don't give direct package url on listing page
+        if url and not self._looks_like_url(url):
+            url = ""
+
+        clean_pkg = {
+            "agency_id": agency_id,
+            "package_title": title,
+            "url": url,
+            "price_in_inr": price,
+            "duration_days": days,
+            "duration_nights": max(days - 1, 0) if days else 0,
+            "destinations": destinations,
+            "countries": pkg.get("countries") or ["India"],
+            "inclusions": pkg.get("inclusions") or [],
+            "exclusions": pkg.get("exclusions") or [],
+            "highlights": pkg.get("highlights") or [],
+            "rating": self._safe_float(pkg.get("rating", 0)),
+            "reviews_count": self._safe_int(pkg.get("reviews_count", 0)),
+            "source_confidence_score": self._safe_float(pkg.get("source_confidence_score", 0.55)),
+            "is_active": True,
+        }
+
+        return clean_pkg
+
+    def _safe_float(self, val: Any) -> float:
+        try:
+            if isinstance(val, str):
+                val = val.replace(",", "").replace("₹", "").replace("INR", "").strip()
+            return float(val)
+        except:
+            return 0.0
+
+    def _safe_int(self, val: Any) -> int:
+        try:
+            return int(float(val))
+        except:
+            return 0
+
+    def _looks_like_url(self, url: str) -> bool:
+        try:
+            parsed = urlparse(url)
+            return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+        except:
             return False
-        
-        # Must have valid price
-        if package.get("price_in_inr", 0) <= 0:
-            return False
-        
-        # Must have valid duration
-        if package.get("duration_days", 0) <= 0:
-            return False
-        
-        # Must have at least one destination
-        if not package.get("destinations"):
-            return False
-        
-        # Price should be reasonable (1000 to 10,000,000 INR)
-        price = package.get("price_in_inr", 0)
-        if price < 1000 or price > 10000000:
-            return False
-        
-        # Duration should be reasonable (1 to 90 days)
-        days = package.get("duration_days", 0)
-        if days < 1 or days > 90:
-            return False
-        
-        return True

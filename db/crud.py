@@ -1,228 +1,152 @@
 """
-CRUD Operations - Create, Read, Update, Delete for database
+Database CRUD operations (Agencies, Packages, Stats, Scrape Jobs)
 """
+
+from __future__ import annotations
+
 from typing import List, Optional, Dict, Any
+from datetime import datetime
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_, func
-from datetime import datetime, timedelta
-import logging
+from sqlalchemy import func, and_
 
-from db.models import Agency, TravelPackage, ScrapingJob, UserQuery
+from db.models import Agency, TravelPackage, ScrapingJob
+from typing import Optional, List     
+from sqlalchemy import or_
 
-logger = logging.getLogger(__name__)
-
-
-# ============================================================================
-# AGENCY CRUD OPERATIONS
-# ============================================================================
+# =============================================================================
+# AGENCY CRUD
+# =============================================================================
 
 def create_agency(
     db: Session,
     name: str,
     domain: str,
     url: str,
-    **kwargs
-) -> Agency:
-    """
-    Create a new agency
-    
-    Args:
-        db: Database session
-        name: Agency name
-        domain: Domain name (e.g., 'example.com')
-        url: Full URL
-        **kwargs: Additional fields (country, city, trust_score, etc.)
-    
-    Returns:
-        Created Agency object
-    """
+    country: str = "India",
+    city: str = "",
+    agency_type: str = "private",
+    trust_score: float = 0.6,
+    is_verified: bool = False,
+    scraping_enabled: bool = True,
+):
     agency = Agency(
         name=name,
         domain=domain,
         url=url,
-        **kwargs
+        country=country,
+        city=city,
+        agency_type=agency_type,
+        trust_score=trust_score,
+        is_verified=is_verified,
+        scraping_enabled=scraping_enabled,
+        created_at=datetime.utcnow(),
     )
+
     db.add(agency)
     db.commit()
     db.refresh(agency)
-    
-    logger.info(f"✅ Created agency: {name} ({domain})")
     return agency
 
 
 def get_agency_by_domain(db: Session, domain: str) -> Optional[Agency]:
-    """Get agency by domain"""
     return db.query(Agency).filter(Agency.domain == domain).first()
 
 
-def get_agency_by_id(db: Session, agency_id: int) -> Optional[Agency]:
-    """Get agency by ID"""
-    return db.query(Agency).filter(Agency.id == agency_id).first()
-
-
-def get_all_agencies(
-    db: Session,
-    skip: int = 0,
-    limit: int = 100,
-    active_only: bool = True
-) -> List[Agency]:
-    """
-    Get all agencies with pagination
-    
-    Args:
-        db: Database session
-        skip: Number of records to skip
-        limit: Maximum records to return
-        active_only: Only return active agencies
-    
-    Returns:
-        List of Agency objects
-    """
+def get_all_agencies(db: Session, limit: int = 100, active_only: bool = True) -> List[Agency]:
     query = db.query(Agency)
-    
+
     if active_only:
-        query = query.filter(Agency.is_active == True)
-    
-    return query.offset(skip).limit(limit).all()
+        query = query.filter(Agency.scraping_enabled == True)
+
+    return query.limit(limit).all()
 
 
-def update_agency_scrape_status(
-    db: Session,
-    agency_id: int,
-    success: bool,
-    packages_found: int = 0
-) -> Optional[Agency]:
+# =============================================================================
+# PACKAGE CRUD
+# =============================================================================
+
+def create_package(db: Session, agency_id: int, pkg_data: Dict[str, Any]) -> TravelPackage:
     """
-    Update agency scraping statistics
-    
-    Args:
-        db: Database session
-        agency_id: Agency ID
-        success: Whether scraping was successful
-        packages_found: Number of packages found
-    
-    Returns:
-        Updated Agency object
+    Create ONE travel package row linked to an agency.
     """
-    agency = get_agency_by_id(db, agency_id)
-    if not agency:
-        return None
-    
-    agency.last_scraped_at = datetime.utcnow()
-    
-    if success:
-        agency.scrape_success_count += 1
-    else:
-        agency.scrape_failure_count += 1
-    
-    db.commit()
-    db.refresh(agency)
-    
-    logger.info(f"✅ Updated scrape status for {agency.name}: success={success}, packages={packages_found}")
-    return agency
 
+    pkg_data = dict(pkg_data)  # safe copy
 
-def get_agencies_needing_scrape(
-    db: Session,
-    hours_since_last_scrape: int = 24
-) -> List[Agency]:
-    """
-    Get agencies that need to be scraped
-    
-    Args:
-        db: Database session
-        hours_since_last_scrape: Minimum hours since last scrape
-    
-    Returns:
-        List of agencies needing scrape
-    """
-    cutoff_time = datetime.utcnow() - timedelta(hours=hours_since_last_scrape)
-    
-    return db.query(Agency).filter(
-        and_(
-            Agency.is_active == True,
-            Agency.scraping_enabled == True,
-            or_(
-                Agency.last_scraped_at == None,
-                Agency.last_scraped_at < cutoff_time
-            )
-        )
-    ).all()
+    # ✅ Ensure agency_id exists
+    pkg_data.pop("agency_id", None)
 
-
-# ============================================================================
-# PACKAGE CRUD OPERATIONS
-# ============================================================================
-
-def create_package(
-    db: Session,
-    agency_id: int,
-    package_data: Dict[str, Any]
-) -> TravelPackage:
-    """
-    Create a new travel package
-    
-    Args:
-        db: Database session
-        agency_id: Agency ID
-        package_data: Package information dict
-    
-    Returns:
-        Created TravelPackage object
-    """
     package = TravelPackage(
         agency_id=agency_id,
-        **package_data
+        package_title=pkg_data.get("package_title", ""),
+        url=pkg_data.get("url", ""),
+        price_in_inr=pkg_data.get("price_in_inr", 0.0) or 0.0,
+        duration_days=pkg_data.get("duration_days", 0) or 0,
+        duration_nights=pkg_data.get("duration_nights", 0) or 0,
+        destinations=pkg_data.get("destinations", []) or [],
+        countries=pkg_data.get("countries", ["India"]) or ["India"],
+        inclusions=pkg_data.get("inclusions", []) or [],
+        exclusions=pkg_data.get("exclusions", []) or [],
+        highlights=pkg_data.get("highlights", []) or [],
+        rating=pkg_data.get("rating", None),
+        reviews_count=pkg_data.get("reviews_count", 0) or 0,
+        source_confidence_score=pkg_data.get("source_confidence_score", 0.6) or 0.6,
+        scraped_at=pkg_data.get("scraped_at", datetime.utcnow()),
+        is_active=pkg_data.get("is_active", True),
+        created_at=datetime.utcnow(),
     )
+
     db.add(package)
     db.commit()
     db.refresh(package)
-    
-    logger.info(f"✅ Created package: {package.package_title} (₹{package.price_in_inr})")
     return package
 
 
-def bulk_create_packages(db, agency_id: int, packages: list[dict]) -> int:
-    created = 0
+def bulk_create_packages(db: Session, agency_id: int, packages: List[Dict[str, Any]]) -> int:
+    """
+    Bulk insert packages (fast)
+    Returns count stored.
+    """
+
+    if not packages:
+        return 0
+
+    count = 0
 
     for pkg_data in packages:
-        # ✅ remove duplicate agency_id if present
-        pkg_data.pop("agency_id", None)
+        try:
+            pkg_data = dict(pkg_data)
+            pkg_data.pop("agency_id", None)
 
-        # ✅ Check for duplicates (Phase 3 Fix)
-        # Strategy: agency_id + url OR agency_id + package_title + duration_days
-        
-        query = db.query(TravelPackage).filter(TravelPackage.agency_id == agency_id)
-        
-        # 1. Check by URL
-        if pkg_data.get("url") and len(pkg_data["url"]) > 10:
-             existing_url = query.filter(TravelPackage.url == pkg_data["url"]).first()
-             if existing_url:
-                 continue
+            package = TravelPackage(
+                agency_id=agency_id,
+                package_title=pkg_data.get("package_title", ""),
+                url=pkg_data.get("url", ""),
+                price_in_inr=pkg_data.get("price_in_inr", 0.0) or 0.0,
+                duration_days=pkg_data.get("duration_days", 0) or 0,
+                duration_nights=pkg_data.get("duration_nights", 0) or 0,
+                destinations=pkg_data.get("destinations", []) or [],
+                countries=pkg_data.get("countries", ["India"]) or ["India"],
+                inclusions=pkg_data.get("inclusions", []) or [],
+                exclusions=pkg_data.get("exclusions", []) or [],
+                highlights=pkg_data.get("highlights", []) or [],
+                rating=pkg_data.get("rating", None),
+                reviews_count=pkg_data.get("reviews_count", 0) or 0,
+                source_confidence_score=pkg_data.get("source_confidence_score", 0.6) or 0.6,
+                scraped_at=pkg_data.get("scraped_at", datetime.utcnow()),
+                is_active=pkg_data.get("is_active", True),
+                created_at=datetime.utcnow(),
+            )
 
-        # 2. Check by Title + Duration
-        if pkg_data.get("package_title"):
-            existing_title = query.filter(
-                TravelPackage.package_title == pkg_data["package_title"],
-                TravelPackage.duration_days == pkg_data.get("duration_days", 0)
-            ).first()
-            if existing_title:
-                continue
+            db.add(package)
+            count += 1
 
-        # ✅ create package properly
-        package = TravelPackage(
-            agency_id=agency_id,
-            **pkg_data
-        )
+        except Exception as e:
+            # skip bad package
+            print(f"⚠️ Skipping bad package: {e}")
 
-        db.add(package)
-        created += 1
+    db.commit()
+    return count
 
-    if created > 0:
-        db.commit()
-    
-    return created
-    
 
 def search_packages(
     db: Session,
@@ -233,221 +157,142 @@ def search_packages(
     max_days: Optional[int] = None,
     skip: int = 0,
     limit: int = 50
-) -> List[TravelPackage]:
-    """
-    Search packages with filters
-    
-    Args:
-        db: Database session
-        destinations: List of destination cities
-        min_price: Minimum price in INR
-        max_price: Maximum price in INR
-        min_days: Minimum duration
-        max_days: Maximum duration
-        skip: Pagination offset
-        limit: Maximum results
-    
-    Returns:
-        List of matching packages
-    """
-    query = db.query(TravelPackage).filter(TravelPackage.is_active == True)
-    
-    # Filter by destinations (check if any destination matches)
+):
+    query = db.query(TravelPackage)
+
+    # ✅ Destination filter (works for JSON/List columns OR string-based columns)
     if destinations:
-        # For JSON column, we need to check if array contains any of the destinations
-        # This is database-specific; for SQLite we'll do a simple text search
+        # Destination list ko lowercase
+        dests = [d.lower().strip() for d in destinations if d]
+
+        # If destinations stored as JSON list in DB
+        # We'll match ANY of them using LIKE fallback (safe)
         destination_filters = []
-        for dest in destinations:
+        for d in dests:
             destination_filters.append(
-                TravelPackage.destinations.contains([dest])
+                TravelPackage.destinations.ilike(f"%{d}%")
             )
-        if destination_filters:
-            query = query.filter(or_(*destination_filters))
-    
-    # Price filters
+
+        query = query.filter(or_(*destination_filters))
+
+    # ✅ Price filters
     if min_price is not None:
         query = query.filter(TravelPackage.price_in_inr >= min_price)
+
     if max_price is not None:
         query = query.filter(TravelPackage.price_in_inr <= max_price)
-    
-    # Duration filters
+
+    # ✅ Duration filters
     if min_days is not None:
         query = query.filter(TravelPackage.duration_days >= min_days)
+
     if max_days is not None:
         query = query.filter(TravelPackage.duration_days <= max_days)
-    
-    # Sort by price (cheapest first)
-    query = query.order_by(TravelPackage.price_in_inr)
-    
+
     return query.offset(skip).limit(limit).all()
 
 
-def get_package_by_id(db: Session, package_id: int) -> Optional[TravelPackage]:
-    """Get package by ID"""
-    return db.query(TravelPackage).filter(TravelPackage.id == package_id).first()
 
+# =============================================================================
+# UPDATE AGENCY SCRAPE STATUS
+# =============================================================================
 
-def get_packages_by_agency(
-    db: Session,
-    agency_id: int,
-    active_only: bool = True
-) -> List[TravelPackage]:
-    """Get all packages from a specific agency"""
-    query = db.query(TravelPackage).filter(TravelPackage.agency_id == agency_id)
-    
-    if active_only:
-        query = query.filter(TravelPackage.is_active == True)
-    
-    return query.all()
-
-
-def deactivate_old_packages(
-    db: Session,
-    agency_id: int,
-    days_old: int = 30
-) -> int:
+def update_agency_scrape_status(db, agency_id: int, success: bool, packages_found: int = 0):
     """
-    Deactivate packages older than X days
-    
-    Args:
-        db: Database session
-        agency_id: Agency ID
-        days_old: Age threshold in days
-    
-    Returns:
-        Number of packages deactivated
+    Update scraping status of agency safely (works even if model doesn't have counters)
     """
-    cutoff_date = datetime.utcnow() - timedelta(days=days_old)
-    
-    updated = db.query(TravelPackage).filter(
-        and_(
-            TravelPackage.agency_id == agency_id,
-            TravelPackage.scraped_at < cutoff_date,
-            TravelPackage.is_active == True
-        )
-    ).update({"is_active": False})
-    
+    agency = db.query(Agency).filter(Agency.id == agency_id).first()
+
+    if not agency:
+        return None
+
+    # ✅ basic status fields
+    agency.last_scraped_at = datetime.utcnow()
+    agency.last_scrape_success = success
+    agency.last_scrape_packages_found = packages_found
+
+    # ✅ optional counters (only if they exist in model)
+    if success:
+        if hasattr(agency, "success_count"):
+            agency.success_count = (agency.success_count or 0) + 1
+    else:
+        if hasattr(agency, "fail_count"):
+            agency.fail_count = (agency.fail_count or 0) + 1
+
     db.commit()
-    
-    logger.info(f"✅ Deactivated {updated} old packages for agency {agency_id}")
-    return updated
+    db.refresh(agency)
+
+    print(
+        f"INFO:db.crud:✅ Updated scrape status for {agency.name}: "
+        f"success={success}, packages={packages_found}"
+    )
+
+    return agency
 
 
-# ============================================================================
-# SCRAPING JOB OPERATIONS
-# ============================================================================
+# =============================================================================
+# DATABASE STATS
+# =============================================================================
 
-def create_scraping_job(
+def get_database_stats(db: Session) -> Dict[str, Any]:
+    agencies_total = db.query(Agency).count()
+    agencies_active = db.query(Agency).filter(Agency.scraping_enabled == True).count()
+
+    packages_total = db.query(TravelPackage).count()
+    packages_active = db.query(TravelPackage).filter(TravelPackage.is_active == True).count()
+
+    return {
+        "agencies_total": agencies_total,
+        "agencies_active": agencies_active,
+        "packages_total": packages_total,
+        "packages_active": packages_active,
+    }
+
+
+# =============================================================================
+# SCRAPING JOB TRACKING (OPTIONAL - but your test_db_ops uses it)
+# =============================================================================
+
+def create_scrape_job(
     db: Session,
     job_id: str,
-    agency_id: Optional[int] = None,
-    job_type: str = "package_scrape"
-) -> ScrapingJob:
-    """Create a new scraping job"""
-    job = ScrapingJob(
+    agency_id: int,
+    status: str = "pending",
+    started_at: Optional[datetime] = None,
+):
+    job = ScrapeJob(
         job_id=job_id,
         agency_id=agency_id,
-        job_type=job_type,
-        status="pending"
+        status=status,
+        started_at=started_at or datetime.utcnow(),
+        created_at=datetime.utcnow(),
     )
+
     db.add(job)
     db.commit()
     db.refresh(job)
-    
     return job
 
 
-def update_scraping_job(
+def update_scrape_job_status(
     db: Session,
     job_id: str,
     status: str,
-    packages_found: int = 0,
-    packages_stored: int = 0,
-    error_message: Optional[str] = None
-) -> Optional[ScrapingJob]:
-    """Update scraping job status"""
-    job = db.query(ScrapingJob).filter(ScrapingJob.job_id == job_id).first()
-    
+    finished_at: Optional[datetime] = None,
+    error_message: Optional[str] = None,
+):
+    job = db.query(ScrapeJob).filter(ScrapeJob.job_id == job_id).first()
     if not job:
         return None
-    
+
     job.status = status
-    job.packages_found = packages_found
-    job.packages_stored = packages_stored
-    
-    if error_message:
-        job.error_message = error_message
-    
-    if status == "running" and not job.started_at:
-        job.started_at = datetime.utcnow()
-    
-    if status in ["completed", "failed"]:
-        job.completed_at = datetime.utcnow()
-        if job.started_at:
-            duration = (job.completed_at - job.started_at).total_seconds()
-            job.duration_seconds = duration
-    
+    job.finished_at = finished_at or datetime.utcnow()
+    job.error_message = error_message
+
     db.commit()
     db.refresh(job)
-    
     return job
 
 
-# ============================================================================
-# USER QUERY OPERATIONS
-# ============================================================================
-
-def log_user_query(
-    db: Session,
-    query_id: str,
-    raw_query: str,
-    parsed_intent: Optional[Dict] = None,
-    packages_returned: int = 0,
-    response_time_ms: Optional[float] = None
-) -> UserQuery:
-    """Log a user query for analytics"""
-    user_query = UserQuery(
-        query_id=query_id,
-        raw_query=raw_query,
-        parsed_intent=parsed_intent,
-        packages_returned=packages_returned,
-        response_time_ms=response_time_ms
-    )
-    db.add(user_query)
-    db.commit()
-    db.refresh(user_query)
-    
-    return user_query
-
-
-# ============================================================================
-# STATISTICS & ANALYTICS
-# ============================================================================
-
-
-def get_db_stats(db: Session) -> Dict[str, Any]:
-    """
-    Returns quick database stats for health check API
-    """
-    return {
-        "total_agencies": db.query(Agency).count(),
-        "active_agencies": db.query(Agency).filter(Agency.is_active == True).count(),
-        "total_packages": db.query(TravelPackage).count(),
-        "active_packages": db.query(TravelPackage).filter(TravelPackage.is_active == True).count(),
-        "total_jobs": db.query(ScrapingJob).count()
-    }
-
-# ---------------------------
-# AGENCY READ OPERATIONS
-# ---------------------------
-
-def get_agencies(db: Session, skip: int = 0, limit: int = 50) -> List[Agency]:
-    """
-    Fetch all agencies
-    """
-    return (
-        db.query(Agency)
-        .offset(skip)
-        .limit(limit)
-        .all()
-    )
+def get_scrape_job(db: Session, job_id: str) -> Optional[ScrapeJob]:
+    return db.query(ScrapeJob).filter(ScrapeJob.job_id == job_id).first()

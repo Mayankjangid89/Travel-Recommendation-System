@@ -1,20 +1,27 @@
 """
-LLM Helper - Google Gemini + Fallback Regex Extractor
-- Extract packages from HTML using Gemini
-- If Gemini fails / quota exceeded, fallback to regex-based extraction
-- Generate recommendation response for demo (without LLM call)
+LLM Helper - Google Gemini + BeautifulSoup Fallback Extractor
+
+✅ Features:
+- Extract packages from HTML using Gemini (STRICT JSON)
+- If Gemini fails / quota exceeded -> BeautifulSoup fallback extraction
+- Cleans/normalizes extracted packages so DB normalizer won't reject
+- Minimal, production-safe, no heavy hallucination prompts
+
+ENV:
+- GEMINI_API_KEY
+- LLM_MODEL (default: gemini-2.5-flash-lite)
 """
 
 import os
 import json
 import re
+import time
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from datetime import datetime
+from urllib.parse import urljoin
 
 from dotenv import load_dotenv
-
-# ✅ Gemini SDK
 import google.generativeai as genai
 
 logger = logging.getLogger(__name__)
@@ -40,312 +47,296 @@ class GeminiLLM:
     def extract_packages_from_html(self, html: str, url: str) -> List[Dict[str, Any]]:
         """
         Extract travel packages from HTML using Gemini.
-        If Gemini fails (quota / timeout), fallback to regex extraction.
+        If Gemini fails -> fallback to BeautifulSoup extraction.
         """
-        # Retry logic for rate limits
-        max_retries = 3
-        base_delay = 5  # seconds
+        max_retries = 2
+        base_delay = 3
 
         for attempt in range(max_retries):
             try:
                 prompt = f"""
-You are a travel package extraction system.
+You are a STRICT travel package extractor.
 
-Extract ALL travel packages from the HTML below.
+Return ONLY valid JSON array. No markdown. No explanation.
 
-Return STRICT JSON array only (no markdown).
-Each package object must include these fields:
-- package_title (string)
-- price_in_inr (number or 0)
-- duration_days (integer or 0)
-- destinations (list of strings)
-- url (string - if relative, keep it relative)
+Each object MUST contain:
+- package_title: string
+- price_in_inr: number (0 if unknown)
+- duration_days: integer (0 if unknown)
+- destinations: array of strings (empty if unknown)
+- url: string (absolute if possible)
+
+Rules:
+- Extract maximum possible packages from HTML.
+- Ignore navigation links.
+- Use visible tour/package titles.
 
 HTML:
-{html[:25000]}
+{html[:22000]}
 """
                 response = self.model.generate_content(prompt)
-                text = response.text.strip()
+                text = (response.text or "").strip()
 
-                # ✅ Remove code block formatting if returned
+                # remove any accidental code block wrappers
                 text = text.replace("```json", "").replace("```", "").strip()
 
                 data = json.loads(text)
+                if not isinstance(data, list):
+                    raise ValueError("Gemini output not a JSON list")
 
-                if isinstance(data, list):
-                    cleaned = self._clean_packages(data)
-                    logger.info(f"✅ Gemini extracted {len(cleaned)} packages from {url}")
-                    return cleaned
-                
-                logger.warning("⚠️ Gemini returned non-list JSON. Retrying...")
-            
+                cleaned = self._clean_packages(data, base_url=url)
+                logger.info(f"✅ Gemini extracted {len(cleaned)} packages from {url}")
+                return cleaned
+
             except Exception as e:
-                # Check for 429
-                error_str = str(e)
-                if "429" in error_str or "quota" in error_str.lower():
+                err = str(e).lower()
+
+                # Rate limit / quota -> retry
+                if "429" in err or "quota" in err or "rate" in err:
                     wait_time = base_delay * (2 ** attempt)
-                    logger.warning(f"⏳ Gemini Rate Limit hit. Waiting {wait_time}s... (Attempt {attempt+1}/{max_retries})")
-                    import time
+                    logger.warning(
+                        f"⏳ Gemini quota/rate limit hit. Waiting {wait_time}s (attempt {attempt+1}/{max_retries})"
+                    )
                     time.sleep(wait_time)
-                else:
-                    logger.error(f"❌ Gemini extraction error: {e}")
-                    break # Don't retry other errors
+                    continue
+
+                logger.error(f"❌ Gemini extraction error: {e}")
+                break
 
         logger.warning("🟡 Switching to fallback extraction (BeautifulSoup mode)...")
-        return self._fallback_extract_packages(html, url)
+        return self._fallback_extract_packages_bs(html, url)
 
     # ==========================================================
-    # ✅ FALLBACK: BEAUTIFULSOUP BASED EXTRACTION
+    # ✅ FALLBACK: BEAUTIFULSOUP EXTRACTION
     # ==========================================================
-    def _fallback_extract_packages(self, html: str, url: str) -> List[Dict[str, Any]]:
+    def _fallback_extract_packages_bs(self, html: str, url: str) -> List[Dict[str, Any]]:
         """
-        Robust fallback using BeautifulSoup:
-        - Tries to identify package cards
-        - Extracts price/duration from within cards
+        A robust fallback extractor:
+        - Finds possible tour/package cards
+        - Extracts title + link + price + duration
+        - Keeps package if it looks like a tour even if price/duration missing
         """
         from bs4 import BeautifulSoup
+
         soup = BeautifulSoup(html, "html.parser")
-        packages = []
+        packages: List[Dict[str, Any]] = []
 
-        # 1. Identify common card containers
-        # Look for repeated elements with relevant class names
-        card_candidates = soup.find_all(lambda tag: tag.name in ['div', 'li', 'article'] and 
-                                      any(c in (tag.get('class') or []) for c in ['package', 'tour', 'trip', 'card', 'item', 'offer']))
-        
-        # If no specific classes, try generic large containers that might be cards
-        if not card_candidates:
-             card_candidates = soup.find_all('div', recursive=True)
-             # Filter for divs that have some text content and structure
-             card_candidates = [d for d in card_candidates if len(d.text) > 50 and len(d.find_all(['h1','h2','h3','h4','a'])) > 0][:50]
+        # Remove script/style noise
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
 
-        logger.info(f"🔎 Found {len(card_candidates)} candidate package cards")
+        # Candidate cards = repeated blocks
+        candidates = soup.find_all(
+            lambda t: t.name in ["div", "li", "article", "section"]
+            and any(
+                c in (t.get("class") or [])
+                for c in ["package", "tour", "trip", "card", "offer", "product", "item"]
+            )
+        )
 
-        count = 0
-        for card in card_candidates:
-            text = card.get_text(" ", strip=True)
-            
-            # Find Title (usually h2, h3, h4 or first strong link)
-            title = ""
-            header = card.find(['h2', 'h3', 'h4', 'h5'])
-            if header:
-                title = header.get_text(strip=True)
-            else:
-                # Try finding a link with substantial text
-                links = card.find_all('a')
-                for link in links:
-                    if len(link.get_text(strip=True)) > 10:
-                        title = link.get_text(strip=True)
-                        break
-            
-            if not title or len(title) < 5:
+        # If nothing found, fallback to anchors with tour-like text
+        if not candidates:
+            candidates = soup.find_all("a", href=True)
+
+        logger.info(f"🔎 Fallback candidates found: {len(candidates)}")
+
+        seen_titles = set()
+
+        for node in candidates[:250]:
+            text = node.get_text(" ", strip=True)
+            if not text or len(text) < 6:
                 continue
 
-            # Find Price
-            price = 0
-            price_match = re.search(r'(?:₹|Rs\.?|INR)\s?([\d,]+)', text, re.IGNORECASE)
-            if price_match:
-                try:
-                    price = float(price_match.group(1).replace(",", ""))
-                except:
-                    pass
+            title = self._extract_title_from_node(node)
+            if not title or len(title) < 6:
+                continue
 
-            # Find Duration
-            duration = 0
-            dur_match = re.search(r'(\d+)\s?(?:Days|Day|D|Nights|Night|N)', text, re.IGNORECASE)
-            if dur_match:
-                try:
-                    duration = int(dur_match.group(1))
-                except:
-                    pass
-            
-            # Heuristic: If we found a title but no price/duration, check if we simply missed it or if it's not a package
-            # Let's be lenient on fallback: if we have a title that looks "tour-like", keep it even if price is 0
-            is_tour_title = any(w in title.lower() for w in ['tour', 'trip', 'package', 'camp', 'trek', 'expedition', 'manali', 'goa'])
-            
-            if is_tour_title:
-                 # Attempt to extract link
-                card_link = url
-                a_tag = card.find('a', href=True)
-                if a_tag:
-                    href = a_tag['href']
-                    if href.startswith("http"):
-                        card_link = href
-                    else:
-                        # simple join
-                        if url.endswith("/"):
-                            card_link = url + href.lstrip("/")
-                        else:
-                            card_link = url + "/" + href.lstrip("/")
+            # Must look like a tour
+            if not self._looks_like_package_title(title):
+                continue
 
-                pkg = {
-                    "package_title": title,
-                    "price_in_inr": price,
-                    "duration_days": duration,
-                    "destinations": self._guess_destinations_from_title(title),
-                    "url": card_link,
-                    "scraped_at": datetime.utcnow().isoformat()
-                }
-                
-                # Dedup by title
-                if not any(p['package_title'] == title for p in packages):
-                    packages.append(pkg)
-                    count += 1
-            
-            if count >= 20: break
+            if title.lower() in seen_titles:
+                continue
 
-        if not packages:
-            logger.info("⚠️ BeautifulSoup fallback found nothing, trying global regex...")
-            return self._fallback_regex_global(html, url)
+            seen_titles.add(title.lower())
+
+            price = self._extract_price(text)
+            duration = self._extract_duration(text)
+
+            href = ""
+            if node.name == "a":
+                href = node.get("href", "")
+            else:
+                a_tag = node.find("a", href=True)
+                href = a_tag.get("href", "") if a_tag else ""
+
+            full_url = urljoin(url, href) if href else url
+
+            pkg = {
+                "package_title": title.strip(),
+                "price_in_inr": float(price),
+                "duration_days": int(duration),
+                "destinations": self._guess_destinations_from_text(title),
+                "url": full_url,
+                "scraped_at": datetime.utcnow().isoformat(),
+                "source_confidence_score": 0.55,
+            }
+
+            packages.append(pkg)
+
+            # keep it small for performance
+            if len(packages) >= 30:
+                break
 
         logger.info(f"✅ BeautifulSoup fallback extracted {len(packages)} packages from {url}")
-        return packages
-
-    def _fallback_regex_global(self, html: str, url: str) -> List[Dict[str, Any]]:
-        """
-        Original regex extraction as last resort
-        """
-        packages = []
-        clean_text = re.sub("<[^<]+?>", " ", html)
-        clean_text = re.sub(r"\s+", " ", clean_text)
-
-        title_patterns = [
-            r"([A-Z][A-Za-z0-9&,\- ]{6,80}?(?:Tour|Trip|Package|Trek|Backpacking|Holiday|Camping))"
-        ]
-        
-        # ... (simplified logic from before)
-        titles = []
-        for pat in title_patterns:
-            titles.extend(re.findall(pat, clean_text))
-        
-        seen = set()
-        unique_titles = []
-        for t in titles:
-            if t not in seen and len(t) > 10:
-                seen.add(t)
-                unique_titles.append(t)
-        
-        # Try to find loose prices/durations to map (very rough)
-        prices_match = re.findall(r'(?:₹|Rs\.?|INR)\s?([\d,]+)', clean_text)
-        durations_match = re.findall(r'(\d+)\s?(?:Days|Day|D)', clean_text)
-
-        for i, title in enumerate(unique_titles[:15]):
-            price = 0
-            if i < len(prices_match):
-                try: price = float(prices_match[i].replace(",", ""))
-                except: pass
-            
-            duration = 0
-            if i < len(durations_match):
-                try: duration = int(durations_match[i])
-                except: pass
-
-            packages.append({
-                "package_title": title,
-                "price_in_inr": price,
-                "duration_days": duration,
-                "destinations": self._guess_destinations_from_title(title),
-                "url": url,
-                "scraped_at": datetime.utcnow().isoformat()
-            })
-        
         return packages
 
     # ==========================================================
     # ✅ CLEANING OUTPUT
     # ==========================================================
-    def _clean_packages(self, packages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _clean_packages(self, packages: List[Dict[str, Any]], base_url: str) -> List[Dict[str, Any]]:
         """
-        Normalize packages returned by Gemini
+        Normalize packages returned by Gemini.
         """
-        cleaned = []
+        cleaned: List[Dict[str, Any]] = []
 
         for pkg in packages:
-            title = pkg.get("package_title") or pkg.get("title") or ""
-            price = pkg.get("price_in_inr") or pkg.get("price_inr") or 0
-            days = pkg.get("duration_days") or 0
-            dest = pkg.get("destinations") or []
+            if not isinstance(pkg, dict):
+                continue
+
+            title = (pkg.get("package_title") or pkg.get("title") or "").strip()
+            if not title:
+                continue
+
+            raw_price = pkg.get("price_in_inr") or pkg.get("price") or 0
+            raw_days = pkg.get("duration_days") or pkg.get("days") or 0
 
             try:
-                price = float(price)
+                price = float(str(raw_price).replace(",", "").replace("₹", "").strip())
             except:
-                price = 0
+                price = 0.0
 
             try:
-                days = int(days)
+                days = int(raw_days)
             except:
                 days = 0
 
-            if not isinstance(dest, list):
-                dest = []
+            destinations = pkg.get("destinations") or []
+            if not isinstance(destinations, list):
+                destinations = []
 
-            cleaned.append({
-                "package_title": title.strip(),
-                "price_in_inr": price,
-                "duration_days": days,
-                "destinations": dest,
-                "url": pkg.get("url", ""),
-                "scraped_at": datetime.utcnow().isoformat(),
-                "source_confidence_score": 0.8
-            })
+            url = (pkg.get("url") or "").strip()
+            if url:
+                url = urljoin(base_url, url)
+            else:
+                url = base_url
+
+            cleaned.append(
+                {
+                    "package_title": title,
+                    "price_in_inr": price,
+                    "duration_days": days,
+                    "destinations": destinations,
+                    "url": url,
+                    "scraped_at": datetime.utcnow().isoformat(),
+                    "source_confidence_score": float(pkg.get("source_confidence_score", 0.75)),
+                }
+            )
 
         return cleaned
 
     # ==========================================================
-    # ✅ DESTINATION GUESS HELPER (fallback)
+    # ✅ Helpers
     # ==========================================================
-    def _guess_destinations_from_title(self, title: str) -> List[str]:
+    def _extract_title_from_node(self, node) -> str:
+        # Prefer headings
+        header = node.find(["h1", "h2", "h3", "h4", "h5"])
+        if header:
+            return header.get_text(" ", strip=True)
+
+        # Else anchor text
+        if node.name == "a":
+            return node.get_text(" ", strip=True)
+
+        # Else find best anchor inside
+        a_tag = node.find("a")
+        if a_tag and a_tag.get_text(strip=True):
+            return a_tag.get_text(" ", strip=True)
+
+        # Else strong/b tags
+        strong = node.find(["strong", "b"])
+        if strong:
+            return strong.get_text(" ", strip=True)
+
+        return ""
+
+    def _looks_like_package_title(self, title: str) -> bool:
+        t = title.lower()
+        keywords = [
+            "tour",
+            "trip",
+            "package",
+            "trek",
+            "camp",
+            "holiday",
+            "travel",
+            "expedition",
+            "manali",
+            "goa",
+            "kashmir",
+            "ladakh",
+            "jaipur",
+            "shimla",
+        ]
+        return any(k in t for k in keywords)
+
+    def _extract_price(self, text: str) -> float:
+        m = re.search(r"(?:₹|rs\.?|inr)\s*([\d,]+)", text, re.IGNORECASE)
+        if not m:
+            return 0.0
+        try:
+            return float(m.group(1).replace(",", ""))
+        except:
+            return 0.0
+
+    def _extract_duration(self, text: str) -> int:
+        # "5 Days", "4N/5D", "3 Nights"
+        m = re.search(r"(\d+)\s*(?:days|day|d)\b", text, re.IGNORECASE)
+        if m:
+            try:
+                return int(m.group(1))
+            except:
+                return 0
+
+        m2 = re.search(r"(\d+)\s*(?:nights|night|n)\b", text, re.IGNORECASE)
+        if m2:
+            try:
+                return int(m2.group(1))
+            except:
+                return 0
+
+        # 4N/5D
+        m3 = re.search(r"(\d+)\s*n\s*/\s*(\d+)\s*d", text, re.IGNORECASE)
+        if m3:
+            try:
+                return int(m3.group(2))
+            except:
+                return 0
+
+        return 0
+
+    def _guess_destinations_from_text(self, text: str) -> List[str]:
         known_places = [
             "Manali", "Kasol", "Jaipur", "Udaipur", "Jodhpur", "Goa",
             "Delhi", "Shimla", "Kullu", "Amritsar", "Dubai", "Abu Dhabi",
-            "Kerala", "Rishikesh", "Leh", "Ladakh"
+            "Kerala", "Rishikesh", "Leh", "Ladakh", "Kashmir", "Agra"
         ]
-
         found = []
         for place in known_places:
-            if place.lower() in title.lower():
+            if place.lower() in text.lower():
                 found.append(place)
-
         return found
 
-    # ==========================================================
-    # ✅ STEP 8 FIX: RESPONSE GENERATOR (No Gemini calls)
-    # ==========================================================
-    def generate_recommendation_response(self, query: str, packages: list, top_packages: list) -> str:
-        """
-        Generate human-friendly response for the top ranked packages.
-        No LLM call needed, works even if Gemini quota exceeded.
-        """
 
-        if not top_packages:
-            return "❌ Sorry! I couldn't find any packages matching your requirements."
-
-        lines = []
-        lines.append("✅ Here are the best travel packages I found for you:\n")
-        lines.append(f"📝 Your Query: {query}\n")
-
-        for i, pkg in enumerate(top_packages, 1):
-            title = pkg.get("package_title") or pkg.get("title") or "Untitled Package"
-            price = pkg.get("price_in_inr") or pkg.get("price_inr") or 0
-            days = pkg.get("duration_days") or 0
-            dest = pkg.get("destinations") or []
-            url = pkg.get("url") or ""
-
-            dest_str = ", ".join(dest[:5]) if isinstance(dest, list) else str(dest)
-
-            lines.append(
-                f"{i}. ⭐ {title}\n"
-                f"   💰 Price: ₹{price}\n"
-                f"   🗓️ Duration: {days} days\n"
-                f"   📍 Destinations: {dest_str}\n"
-                f"   🔗 Link: {url}\n"
-            )
-
-        lines.append("🎯 Tip: Want a perfect itinerary? Tell me your starting city + travel month.")
-        return "\n".join(lines)
-
-
-# ==========================================================
-# ✅ HELPER FUNCTION FOR PROJECT
-# ==========================================================
 def get_llm() -> GeminiLLM:
     return GeminiLLM()

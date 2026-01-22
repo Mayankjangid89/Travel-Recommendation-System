@@ -1,126 +1,112 @@
 """
-Scrape + Store Packages into Database
-- Scrapes agencies from DB
-- Extracts packages using Playwright + Gemini (fallback supported)
-- Stores packages into DB
-- Updates agency scrape status
-- LIMIT: scrape max 3 agencies per run
+Scrape agencies and store packages in database
+This populates your database with real data
 """
-
-
 import asyncio
-from sqlalchemy.orm import Session
+import sys
+from datetime import datetime
 
 from db.sessions import SessionLocal
 from db.crud import (
-    get_all_agencies,
-    bulk_create_packages,
+    get_agency_by_domain,
+    create_package,
     update_agency_scrape_status,
+    get_all_agencies
 )
 from tools.scraper_engine import ScraperEngine
-from tools.normalizer import DataNormalizer  # Added import
+from tools.normalizer import DataNormalizer
 
 
-MAX_AGENCIES_PER_RUN = 3  # scrape only 3 agencies per run
-
-
-def should_scrape_now(agency) -> bool:
-    """
-    Decide whether to scrape an agency again.
-    For now: Always scrape.
-    Later you can add: last_scraped_at + cooldown logic
-    """
-    return True
-
-
-async def scrape_and_store():
+async def scrape_and_store_packages():
+    """Scrape all agencies and store packages"""
+    db = SessionLocal()
+    normalizer = DataNormalizer()
+    
     print("=" * 80)
-    print("SCRAPE + STORE PACKAGES INTO DATABASE")
+    print("🚀 SCRAPING AGENCIES AND STORING PACKAGES")
     print("=" * 80)
+    print()
+    
+    # Get all active agencies
+    agencies = get_all_agencies(db, limit=100, active_only=True)
+    TARGET_DOMAINS = ["youthcamping.in", "thrillblazers.in"]
+    agencies = [a for a in agencies if a.domain in TARGET_DOMAINS]
 
-    db: Session = SessionLocal()
-    normalizer = DataNormalizer()  # Initialize normalizer
-
-    try:
-        agencies = get_all_agencies(db)
-
-        if not agencies:
-            print("No agencies found in DB. Run seed_agencies first.")
-            return
-
-        # Always scrape Youth Camping first if present
-        agencies.sort(key=lambda a: 0 if "youthcamping" in a.domain else 1)
-
-        print(f"Found {len(agencies)} agencies in DB")
-        print(f"Scrape limit enabled: {MAX_AGENCIES_PER_RUN} agencies per run")
-
-        # Apply limit
-        agencies_to_scrape = []
-        for a in agencies:
-            if should_scrape_now(a):
-                agencies_to_scrape.append(a)
-            if len(agencies_to_scrape) >= MAX_AGENCIES_PER_RUN:
-                break
-
-        print(f"Will scrape {len(agencies_to_scrape)} agencies this run")
-        print()
-
-        async with ScraperEngine() as scraper:
-            for agency in agencies_to_scrape:
-                print("-" * 80)
-                print(f"Scraping Agency: {agency.name} ({agency.url})")
-
-                try:
-                    result = await scraper.scrape_agency(
-                        url=agency.url,
-                        agency_name=agency.name,
-                        extract_packages=True
-                    )
-
-                    if not result or not result.get("success"):
-                        print("Scraping failed or empty response")
-                        update_agency_scrape_status(db, agency.id, False, 0)
-                        continue
-
-                    packages = result.get("packages", [])
-                    print(f"Scraped {len(packages)} packages")
-
-                    if not packages:
-                        print("No valid packages extracted to store")
-                        update_agency_scrape_status(db, agency.id, False, 0)
-                        continue
-
-                    # NORMALIZE packages
-                    normalized_packages = normalizer.normalize_packages_batch(packages, agency.id)
-                    print(f"Normalized {len(normalized_packages)} packages (valid only)")
-
-                    if not normalized_packages:
-                        print("No valid packages after normalization (check price/duration)")
-                        update_agency_scrape_status(db, agency.id, False, 0)
-                        continue
-
-                    # Store into DB
-                    stored_count = bulk_create_packages(db, agency.id, normalized_packages)
-                    print(f"Stored {stored_count} packages into DB")
-
-                    # Update scrape status
-                    update_agency_scrape_status(db, agency.id, True, stored_count)
-
-                except Exception as e:
-                    print(f"Error while scraping {agency.name}: {e}")
+    if not agencies:
+        print("❌ No agencies found in database!")
+        print("   Run: python scripts\\seed_agencies.py")
+        return
+    
+    print(f"📋 Found {len(agencies)} agencies to scrape\n")
+    
+    total_packages = 0
+    
+    # Scrape each agency
+    async with ScraperEngine() as scraper:
+        for i, agency in enumerate(agencies, 1):
+            print(f"\n[{i}/{len(agencies)}] Scraping: {agency.name}")
+            print(f"   URL: {agency.url}")
+            
+            try:
+                # Scrape the agency
+                result = await scraper.scrape_agency(
+                    url=agency.url,
+                    agency_name=agency.name,
+                    extract_packages=True
+                )
+                
+                if not result['success']:
+                    print(f"   ❌ Scraping failed: {result.get('error', 'Unknown error')}")
+                    update_agency_scrape_status(db, agency.id, success=False)
+                    continue
+                
+                raw_packages = result['packages']
+                print(f"   ✅ Found {len(raw_packages)} raw packages")
+                
+                # Normalize packages
+                normalized_packages = normalizer.normalize_packages_batch(
+                    raw_packages,
+                    agency.id
+                )
+                
+                if not normalized_packages:
+                    print(f"   ⚠️  No valid packages after normalization")
+                    update_agency_scrape_status(db, agency.id, success=True, packages_found=0)
+                    continue
+                
+                print(f"   ✅ Normalized {len(normalized_packages)} packages")
+                
+                # Store in database
+                stored_count = 0
+                for pkg_data in normalized_packages:
                     try:
-                        update_agency_scrape_status(db, agency.id, False, 0)
-                    except Exception as inner:
-                        print(f"Failed updating agency status too: {inner}")
-
-        print()
-        print("=" * 80)
-        print("SCRAPING + STORAGE COMPLETE")
-        print("=" * 80)
-
-    finally:
-        db.close()
+                        create_package(db, agency.id, pkg_data)
+                        stored_count += 1
+                    except Exception as e:
+                        print(f"   ⚠️  Failed to store package: {e}")
+                
+                print(f"   ✅ Stored {stored_count} packages in database")
+                total_packages += stored_count
+                
+                # Update agency scrape status
+                update_agency_scrape_status(
+                    db,
+                    agency.id,
+                    success=True,
+                    packages_found=stored_count
+                )
+                
+            except Exception as e:
+                print(f"   ❌ Error: {e}")
+                update_agency_scrape_status(db, agency.id, success=False)
+    
+    db.close()
+    
+    print("\n" + "=" * 80)
+    print(f"✅ SCRAPING COMPLETE!")
+    print(f"   Total packages stored: {total_packages}")
+    print("=" * 80)
 
 
 if __name__ == "__main__":
-    asyncio.run(scrape_and_store())
+    asyncio.run(scrape_and_store_packages())

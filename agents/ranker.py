@@ -35,10 +35,10 @@ class PackageRanker:
     # Public
     # ----------------------------
     def rank_packages(
-        self,
-        intent: ParsedIntent,
-        packages: List[Union[Dict[str, Any], Any]],
-        max_results: int = 5,
+    self,
+    packages: list,
+    intent: ParsedIntent,
+    max_results: int = 5
     ) -> List[RankedPackage]:
         """
         Rank packages based on intent match.

@@ -28,6 +28,17 @@ def seed_agencies():
             "scraping_enabled": True
         },
         {
+             "name": "Thrillblazers",
+             "domain": "thrillblazers.in",
+             "url": "https://thrillblazers.in/",
+             "country": "India",
+             "city": "Delhi",
+             "agency_type": "private",
+             "trust_score": 0.78,
+             "is_verified": False
+        },
+
+        {
             "name": "Himalayan Dream Treks",
             "domain": "himalayandreamtreks.in",
             "url": "https://himalayandreamtreks.in/tours/",
@@ -110,6 +121,7 @@ def seed_agencies():
             "url": "https://www.jaipurtaxiservice.com/rajasthan-tour-packages.html",
             "country": "India",
             "city": "Jaipur",
+        
             "agency_type": "private",
             "trust_score": 0.60,
             "is_verified": False,
